@@ -1,0 +1,15 @@
+# Local Ollama demonstration configuration. The endpoint defaults to
+# OLLAMA_BASE_URL or http://localhost:11434; no API key is used.
+model: huihui-qwen3-8b
+provider: ollama
+seed: 42
+temperature: 0.0
+do_sample: false
+max_new_tokens: 1024
+embedding_model: BAAI/bge-small-en-v1.5
+document_top_k: 3
+memory_top_k: 3
+state_dir: .ragmemsec-state
+artifacts_dir: artifacts/runs
+profile: deterministic_primary
+scenario_order_seed: 42

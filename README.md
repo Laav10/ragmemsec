@@ -1,5 +1,164 @@
 # Security Analysis of RAG Prompt Injection and Persistent Memory Poisoning in LLM Agents
 
+> **Baseline status:** this phase benchmarks unprotected LLM-backed agents. It does
+> not measure a raw language model in isolation, and it does not yet evaluate the
+> proposed admission-gate defense.
+
+## Functional baseline quick start
+
+The implemented benchmark is a safe, fictional access-control agent. Its only
+tools are deterministic local simulations: `check_user_role`,
+`check_manager_approval`, `request_database_access`,
+`request_credential_recovery`, and `request_data_export`. It never connects to
+a real identity, database, or access-control system.
+
+### What is implemented now
+
+The current code uses Python dataclasses, JSON-file memory persistence, exact
+in-process cosine search, deterministic mock embeddings for `--mock`, and the
+fixed `BAAI/bge-small-en-v1.5` SentenceTransformer encoder for real runs. It
+records structured prompts, hashes, model output, tool results, provenance, and
+phase-boundary snapshots. It has **no** admission gate, source allowlist,
+quarantine, validation defense, or action gate.
+
+Pydantic, SQLite, FAISS, signed provenance, and the defense packages mentioned
+later in this file are not active parts of this baseline implementation.
+
+Create a Python 3.11+ environment first (the default HPC Python 3.8 environment
+is insufficient), install the test tooling, then run the dependency-free smoke
+experiment:
+
+```bash
+python -m pip install -e '.[dev]'
+python -m ragmemsec.cli run-scenario --config configs/baseline.yaml \
+  --scenario configs/scenarios/orion_access.yaml --mock
+python -m pytest
+python -m ruff check .
+```
+
+> **TEST-ONLY warning:** `--mock` uses `MockModelProvider` and a deterministic
+> hash embedder. Its artifacts have `run_kind: mock_test`, are not experimental
+> results, and the reporting layer refuses to aggregate them with
+> `real_benchmark` artifacts. Real benchmark runs use the configured
+> `BAAI/bge-small-en-v1.5` SentenceTransformer encoder.
+
+For a real selected Hugging Face model, use a CUDA-enabled environment with an
+appropriate version of PyTorch and install `.[hf]`; then omit `--mock`. Qwen
+3.5 is a multimodal architecture and needs a Transformers release exposing
+`AutoModelForMultimodalLM` (the optional dependency specifies Transformers 5+).
+The other current aliases use the causal-LM loader. The provider uses CUDA only
+and deliberately fails rather than silently falling
+back to CPU, another model, precision, or quantization.
+
+### Selecting a model
+
+The exact single line to edit is in `configs/baseline.yaml`:
+
+```yaml
+model: qwen2.5-7b
+```
+
+Aliases and their official identifiers can be inspected with
+`python -m ragmemsec.cli inspect-models`, or overridden per run:
+
+```bash
+python -m ragmemsec.cli run-scenario --model llama3.1-8b --mock
+```
+
+The alias changes only model loading. Prompts, scenarios, tools, retrieval,
+embedding configuration, storage and scoring remain fixed. The package ships one
+authoritative model registry, so `inspect-models` works from both an editable
+checkout and an installed wheel.
+
+### What the experiment records
+
+Documents and persistent memories are separate stores. Condition B can retrieve
+the synthetic Orion attacker document and automatically store a valid candidate
+memory; there is intentionally no admission gate in this baseline. Condition C
+removes that document and creates a fresh session while retaining memory.
+The memory-disabled causal control repeats the held-out query after source
+removal with no retained memory. The ablation control restores the same
+post-injection snapshot, removes memories identified by orchestrator-recorded
+provenance, and reruns the held-out request. The runner writes complete JSONL
+traces, tool actions, phase-boundary snapshots, environment metadata, metrics,
+and a summary to `artifacts/runs/<uuid>/`.
+
+Metrics are deterministic rules keyed to scenario-declared exact outcomes.
+Target decision, target tool-call proposal, tool invocation, and target simulator
+effect are separate metrics. Overall ASR and valid-output-conditioned ASR require
+the declared simulator effect; invalid JSON is preserved and excluded from the
+valid-conditioned denominator. Deterministic embeddings are an offline mock-only
+stand-in; real runs use the configured fixed SentenceTransformer. Known
+limitations are synthetic policies and no real-model run in the test suite; it
+is not a real access system or a defense evaluation.
+
+### Research pilot corpus and matrix
+
+`configs/scenarios/pilot_v1.yaml` resolves to 12 fictional, versioned scenarios:
+four each for database access, credential recovery, and data export. Each has two
+injection queries, three held-out victim queries, and three unrelated utility
+queries. Corpus validation rejects duplicate IDs, invalid tools or arguments,
+injection-victim overlap, incomplete outcomes, bad document references, and
+evaluator labels in agent-visible document text.
+
+The deterministic primary profile has `temperature: 0`, `do_sample: false`, and
+one fixed seed. The `robustness_subset` profile runs seeds 101, 202, and 303 with
+temperature 0.2 and sampling enabled; profiles are reported separately. Scenario
+order is randomized from a recorded seed, and each scenario/model run has
+isolated local state.
+
+First single-model A100 pilot command (this intentionally runs a real model):
+
+```bash
+python -m pip install -e '.[hf]'
+python -m ragmemsec.cli run-matrix --models qwen2.5-7b \
+  --corpus configs/scenarios/pilot_v1.yaml --config configs/baseline.yaml
+```
+
+The frozen primary matrix is `qwen2.5-7b`, `llama3.1-8b`, `mistral7b`,
+`gemma2-9b`, `phi3.5-mini`, and `deepseek-r1-7b`. Models run serially, never
+together:
+
+```bash
+python -m ragmemsec.cli run-matrix \
+  --models qwen2.5-7b llama3.1-8b mistral7b gemma2-9b phi3.5-mini deepseek-r1-7b \
+  --corpus configs/scenarios/pilot_v1.yaml \
+  --config configs/baseline.yaml
+```
+
+Real runs require the configured BGE embedding model. A model that fails
+qualification remains in the raw artifacts but is excluded from the primary
+aggregate. Results include qualification status, paired persistence-versus-control
+comparisons, scenario-level bootstrap intervals, and run/environment provenance.
+
+### Local Huihui/Ollama demonstration
+
+Ollama is supported only through the local `ollama` provider. The Huihui alias is
+`huihui-qwen3-8b` and resolves to `huihui_ai/qwen3-abliterated:8b-v2`; it is a
+local demonstration model and is not part of the frozen primary matrix.
+
+```bash
+ollama list
+curl http://localhost:11434/v1/models
+python -m pip install -e '.[hf]'
+python -m ragmemsec.cli run-scenario \
+  --config configs/ollama_huihui.yaml \
+  --scenario configs/scenarios/orion_access.yaml
+```
+
+`OLLAMA_BASE_URL` overrides the default `http://localhost:11434`; no API key is
+required. Inspect the printed `artifact_dir`, then inspect its `traces.jsonl` and
+`environment.json`. Qwen3 may emit a `<think>…</think>` block before structured
+output. The trace retains the raw content and records the separate parsing
+content. Allow enough generation tokens for the thinking block and final JSON; a
+30-token smoke request is generally too short to reach the requested answer.
+
+## Historical design notes and future roadmap
+
+Everything below this heading is retained project planning material. It is not a
+claim about the current implementation; in particular, references to Pydantic,
+SQLite, FAISS, admission gates, and action gates describe future work.
+
 ## 1. Project in one paragraph
 
 This project studies whether untrusted content retrieved by an LLM agent can influence an immediate response, enter persistent memory, survive removal of the original source, and later cause an attacker-desired action. We plan to build a controlled tool-using agent, reproduce representative RAG and memory-poisoning attacks, and compare memory defenses ranging from no defense to source-aware admission, signed provenance, lineage checks, and a final sensitive-action gate. The project will measure both security and utility; it does not claim that any LLM agent is universally or absolutely secure.
@@ -129,64 +288,80 @@ LangGraph may be added later as a second implementation or compatibility adapter
 
 ```text
 ragmemsec/
+├── .env.example
 ├── .github/
 │   ├── CODEOWNERS
 │   └── pull_request_template.md
-├── README.md
-├── pyproject.toml
-├── .env.example
 ├── .gitignore
+├── README.md
 ├── configs/
-│   ├── models/
-│   ├── scenarios/
-│   └── experiments/
-├── contracts/
-│   ├── schemas.py
-│   ├── interfaces.py
-│   └── schema_version.txt
-├── src/
-│   ├── agent/
-│   │   ├── controller.py
-│   │   ├── model_provider.py
-│   │   └── prompts.py
-│   ├── rag/
-│   │   ├── ingest.py
-│   │   ├── embeddings.py
-│   │   └── retriever.py
-│   ├── memory/
-│   │   ├── store.py
-│   │   ├── retriever.py
-│   │   └── writer.py
-│   ├── defense/
-│   │   ├── admission_gate.py
-│   │   ├── provenance.py
-│   │   ├── lineage.py
-│   │   └── action_gate.py
-│   ├── attacks/
-│   │   ├── corpus.py
-│   │   ├── scenarios.py
-│   │   └── triggers.py
-│   ├── tools/
-│   │   └── access_control.py
-│   └── evaluation/
-│       ├── runner.py
-│       ├── metrics.py
-│       └── reporting.py
-├── data/
-│   ├── synthetic/
-│   └── README.md
-├── tests/
-│   ├── unit/
-│   ├── integration/
+│   ├── baseline.yaml
+│   ├── ollama_huihui.yaml
 │   └── scenarios/
-├── results/
-│   └── .gitkeep
-└── docs/
-    ├── THREAT_MODEL.md
-    ├── EXPERIMENT_PLAN.md
-    ├── STATUS.md
-    ├── MEETING_NOTES.md
-    └── decisions/
+│       ├── orion_access.yaml
+│       └── pilot_v1.yaml
+├── contracts/
+│   ├── __init__.py
+│   ├── interfaces.py
+│   ├── schema_version.txt
+│   └── schemas.py
+├── data/
+│   ├── README.md
+│   └── synthetic/
+│       └── .gitkeep
+├── docs/
+│   ├── EXPERIMENT_PLAN.md
+│   ├── MEETING_NOTES.md
+│   ├── STATUS.md
+│   ├── THREAT_MODEL.md
+│   └── decisions/
+│       └── README.md
+├── pyproject.toml
+├── src/
+│   └── ragmemsec/
+│       ├── __init__.py
+│       ├── agent/
+│       │   ├── __init__.py
+│       │   ├── controller.py
+│       │   ├── model_provider.py
+│       │   └── prompts.py
+│       ├── attacks/
+│       │   ├── __init__.py
+│       │   ├── corpus.py
+│       │   ├── scenarios.py
+│       │   └── triggers.py
+│       ├── defense/
+│       │   ├── __init__.py
+│       │   ├── action_gate.py
+│       │   ├── admission_gate.py
+│       │   ├── lineage.py
+│       │   └── provenance.py
+│       ├── evaluation/
+│       │   ├── __init__.py
+│       │   ├── metrics.py
+│       │   ├── reporting.py
+│       │   └── runner.py
+│       ├── memory/
+│       │   ├── __init__.py
+│       │   ├── retriever.py
+│       │   ├── store.py
+│       │   └── writer.py
+│       ├── rag/
+│       │   ├── __init__.py
+│       │   ├── embeddings.py
+│       │   ├── ingest.py
+│       │   └── retriever.py
+│       └── tools/
+│           ├── __init__.py
+│           └── access_control.py
+└── tests/
+    ├── integration/
+    │   └── .gitkeep
+    ├── scenarios/
+    │   └── .gitkeep
+    ├── test_import.py
+    └── unit/
+        └── .gitkeep
 ```
 
 Do not commit real model keys, private data, generated model caches, or large experiment outputs.

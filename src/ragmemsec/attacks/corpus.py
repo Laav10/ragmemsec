@@ -1,0 +1,1 @@
+"""Attack corpus; implementation deferred."""

@@ -1,0 +1,9 @@
+{
+  "members": [
+    {"member_id": "user-001", "display_name": "Laavanya Rajan", "role": "engineering"},
+    {"member_id": "user-002", "display_name": "Suraj S", "role": "analyst"},
+    {"member_id": "user-003", "display_name": "Mayank Sonawane", "role": "security_review"},
+    {"member_id": "engineer002", "display_name": "Engineer002", "role": "engineering"},
+    {"member_id": "administrator001", "display_name": "Administrator001", "role": "administrator", "administrator": true}
+  ]
+}
